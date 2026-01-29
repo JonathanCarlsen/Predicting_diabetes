@@ -4,6 +4,7 @@
 
 ################################################################################
 ################# SETUP AND LIBRARIES ##########################################
+# We load the packages and set shared plotting defaults.
 library(tidyverse)
 library(tidymodels)
 library(janitor)
@@ -35,11 +36,10 @@ bbc_theme <- ggplot2::theme(
   plot.title = ggplot2::element_text(family = font, size = 20, face = "bold", color = "#222222"),
   plot.subtitle = ggplot2::element_text(family = font, size = 16, face = "bold"),
   legend.position = "bottom",
-  legend.text.align = 0,
+  legend.text = ggplot2::element_text(family = font, size = 16, color = "#222222", hjust = 0),
   legend.background = ggplot2::element_blank(),
   legend.title = ggplot2::element_blank(),
   legend.key = ggplot2::element_blank(),
-  legend.text = ggplot2::element_text(family = font, size = 16, color = "#222222"),
   axis.text = ggplot2::element_text(family = font, size = 10, color = "#222222"),
   axis.text.x = ggplot2::element_text(margin = ggplot2::margin(5, b = 10)),
   axis.ticks = ggplot2::element_blank(),
@@ -53,15 +53,20 @@ bbc_theme <- ggplot2::theme(
 
 theme_set(bbc_theme)
 
-# Evaluation function to standardize our evaluation metrics
-eval_metrics <- function(fit, new_data, outcome) {
+# We define a single evaluation helper so all models are scored the same way.
+eval_metrics <- function(fit, new_data, outcome, threshold = 0.5) {
   outcome <- enquo(outcome)
   prob <- predict(fit, new_data = new_data, type = "prob")
   cls <- predict(fit, new_data = new_data, type = "class")
   preds <- bind_cols(new_data, prob, cls) %>%
-    mutate(.pred_class = factor(.pred_class, levels = c("0", "1")))
+    mutate(
+      .pred_class = factor(
+        if_else(.pred_1 >= threshold, "1", "0"),
+        levels = c("0", "1")
+      )
+    )
   list(
-    metrics = metric_set(accuracy, precision, recall, f_meas, roc_auc)(
+    metrics = metric_set(accuracy, precision, recall, f_meas, roc_auc, pr_auc)(
       preds,
       truth = !!outcome,
       estimate = .pred_class,
@@ -81,13 +86,13 @@ eval_metrics <- function(fit, new_data, outcome) {
     )
   )
 }
-# F1 score at the second level for optimizing for the second event level
+# We create a custom F1 metric that targets the positive class.
 f_meas_pos <- metric_tweak("f_meas_pos", f_meas, event_level = "second")
 
 ################################################################################
 ################# DATA IMPORT AND INITIAL INSPECTION ###########################
 
-# Load raw balanced and unbalanced datasets, inspect structure, and assess missingness and distributions.
+# We load both datasets and inspect structure, missingness, and basic distributions.
 
 set.seed(123)
 
@@ -116,7 +121,7 @@ df_unbal %>%
 ################################################################################
 ################# DATA CLEANING AND TRANSFORMATIONS ############################
 
-# Prepare categorical levels, create train/test splits, and compute class weights.
+# We standardize factor levels, split data, and compute class weights.
 
 df_unbal <- df_unbal %>%
   mutate(
@@ -146,12 +151,11 @@ train_unbal_w <- train_unbal %>% mutate(case_wt = hardhat::importance_weights(wt
 test_unbal <- test_unbal %>% mutate(case_wt = hardhat::importance_weights(wt_vec[as.character(diabetes_binary)]))
 
 # We create a subsample because of time and compute constraints (adjust the prop for smaller or bigger sample)
-train_unbal_sub <- train_unbal_w %>% slice_sample(prop = 0.55)
+train_unbal_sub <- train_unbal_w %>% slice_sample(prop = 0.5)
 sub_class_ratio <- train_unbal_sub %>%
   summarise(ratio = sum(diabetes_binary == "0") / sum(diabetes_binary == "1")) %>%
   pull(ratio)
 
-unbal_folds <- vfold_cv(train_unbal_w, v = 5, strata = diabetes_binary)
 unbal_folds_sub <- vfold_cv(train_unbal_sub, v = 5, strata = diabetes_binary)
 
 ################################################################################
@@ -327,13 +331,13 @@ server <- function(input, output, session) {
   })
 }
 
-#shinyApp(ui, server)
+# shinyApp(ui, server)
 
 ################################################################################
 ################# FEATURE ENGINEERING ##########################################
 
-# Build a unified recipe that encodes ordered factors, engineered risk scores, interactions, and scaling.
-diab_rec_unified <- recipe(
+# We build the recipe for our classification trees
+model_recipe <- recipe(
   diabetes_binary ~ .,
   data = train_unbal_w,
   case_weights = case_wt
@@ -342,44 +346,36 @@ diab_rec_unified <- recipe(
     gen_hlth_num = as.numeric(gen_hlth),
     age_num = as.numeric(age),
     education_num = as.numeric(education),
-    income_num = as.numeric(income),
-    high_bp_num = as.numeric(as.character(high_bp)),
-    high_chol_num = as.numeric(as.character(high_chol)),
-    heart_dis_num = as.numeric(as.character(heart_diseaseor_attack)),
-    stroke_num = as.numeric(as.character(stroke)),
-    phys_act_num = as.numeric(as.character(phys_activity)),
-    smoker_num = as.numeric(as.character(smoker)),
-    hvy_alc_num = as.numeric(as.character(hvy_alcohol_consump)),
-    diff_walk_num = as.numeric(as.character(diff_walk))
+    income_num = as.numeric(income)
   ) %>%
-  step_mutate(
-    bmi_cat = case_when(
-      bmi < 18.5 ~ "Underweight",
-      bmi < 25 ~ "Normal",
-      bmi < 30 ~ "Overweight",
-      TRUE ~ "Obese"
-    ),
-    bmi_age_interaction = bmi * age_num
-  ) %>%
-  step_mutate(
-    cardio_risk = high_bp_num + high_chol_num + heart_dis_num + stroke_num,
-    bmi_obese = if_else(bmi >= 30, 1, 0)
-  ) %>%
-  step_interact(~ age_num:high_bp_num + age_num:high_chol_num + age_num:diff_walk_num + bmi:age_num) %>%
-  step_ns(age_num, gen_hlth_num, bmi, phys_hlth, deg_free = 4) %>%
-  step_rm(bmi_cat) %>%
-  step_dummy(all_nominal_predictors()) %>%
-  step_zv(all_predictors()) %>%
+  step_rm(gen_hlth, age, education, income) %>%
+  step_dummy(all_factor_predictors(), one_hot = FALSE) %>%
   step_tomek(diabetes_binary, skip = TRUE) %>%
-  step_normalize(all_predictors())
+  step_zv(all_predictors())
+
+# Prep once
+rec_prep <- prep(model_recipe, training = train_unbal_w, retain = TRUE)
+
+# Processed training/test sets
+train_x <- juice(rec_prep)
+test_x  <- bake(rec_prep, new_data = test_unbal)
+
+# We list which columns were created or dropped by the recipe.
+new_cols <- setdiff(names(train_x), names(train_unbal_w))
+dropped  <- setdiff(names(train_unbal_w), names(train_x))
+
+new_cols
+dropped
 
 
 ################################################################################
 ################# FEATURE IMPORTANCE AND BASIC LOGISTIC REGRESSION and CART ####
+# We fit baseline logistic and CART models to get initial signals.
 log_spec <- logistic_reg(mode = "classification") %>% set_engine("glm")
 log_wf <- workflow() %>% add_formula(diabetes_binary ~ .) %>% add_model(log_spec)
 log_fit <- fit(log_wf, data = train_unbal)
 
+log_train_results  <- eval_metrics(log_fit,  new_data = train_unbal,   outcome = diabetes_binary)
 log_results <- eval_metrics(fit = log_fit, new_data = test_unbal, outcome = diabetes_binary)
 
 cart_spec <- decision_tree(
@@ -391,13 +387,15 @@ cart_spec <- decision_tree(
   set_engine("rpart", model = TRUE)
 
 cart_wf <- workflow() %>%
-  add_recipe(diab_rec_unified) %>%
+  add_recipe(model_recipe) %>%
   add_model(cart_spec)
 
 cart_fit <- fit(cart_wf, data = train_unbal_w)
+
+cart_train_results <- eval_metrics(cart_fit, new_data = train_unbal,   outcome = diabetes_binary)
 cart_results <- eval_metrics(fit = cart_fit, new_data = test_unbal, outcome = diabetes_binary)
 
-# Use logistic regression z-scores and CART feature importance for guidance.
+# We use logistic regression z-scores and CART feature importance for guidance.
 log_feat_importance <- log_fit %>%
   extract_fit_parsnip() %>%
   tidy() %>%
@@ -428,129 +426,172 @@ cart_importance %>%
     y = "Importance"
   )
 
-# All of these features are not signifant at a 5% level and are not important for the CART model. 
+# These features are not signifant at a 5% level and are not important for the CART model. 
 # Therefore we drop them.
-low_signal_terms <- c(
-  "bmi_ns_1", "bmi_ns_3", "age_num_ns_4", "age_num_ns_2", "age_num_ns_1",
-  "age_num_ns_3", "age_01", "age_03", "age_num_x_diff_walk_num",
-  "heart_dis_num", "heart_diseaseor_attack_X1", "gen_hlth_2", "stroke_num",
-  "stroke_X1", "income_1", "income_3", "income_4", "income_5", "income_6",
-  "income_num", "veggies_X1", "fruits_X1", "no_docbc_cost_X1",
-  "education_2", "education_3", "education_4", "education_5", "education_6",
-  "education_num"
-)
+low_importance_features <- c(
+  "fruits_X1",
+  "veggies_X1",
+  "no_docbc_cost_X1",
+  "education_num")
 
-diab_rec_selected <- diab_rec_unified %>%
-  step_rm(any_of(low_signal_terms))
+cleaned_recipe <- model_recipe %>%
+  step_rm(any_of(low_importance_features))
 
 ################################################################################
-################# MODELING XGBoost and RandomForest ############################
+################# MODELING XGBoost & RandomForest ############################
 doParallel::registerDoParallel()
-# Fit tuned XGBoost, random forest, and neural network models optimizing F1.
-# Extrme Gradient Boosting
-# XGBoost keeps being too conservative with predicting true positives therefore we try to relax the weighting in a simple way
+# We tune and fit the XGBoost and Random Forest models.
+# We relax the positive class weight to encourage more positive predictions.
 pos_weight <- sqrt(sub_class_ratio)
+
+# Step 1: tune learning rate and trees with other fixed parameters.
 xgb_spec <- boost_tree(
-  trees = 1000,
+  trees = 5000,
+  learn_rate = 0.01,
   tree_depth = tune(),
   min_n = tune(),
-  loss_reduction = 0,
+  loss_reduction = tune(),
   sample_size = tune(),
-  mtry = tune(),
-  learn_rate = 0.0115
+  mtry = tune()
 ) %>%
-  set_engine("xgboost", scale_pos_weight = pos_weight) %>%
+  set_engine(
+    "xgboost",
+    scale_pos_weight = pos_weight,
+    lambda = tune(),
+    alpha  = tune(),
+    early_stopping_rounds = 30
+  ) %>%
   set_mode("classification")
 
-xgb_param_ranges <- list(
-  tree_depth = c(2L, 18L),
-  min_n = c(1L, 30L),
-  sample_size = c(0.05, 1.0),
-  mtry = c(2L, 20L)
-)
+xgb_wf <- workflow() %>%
+  add_recipe(cleaned_recipe) %>%
+  add_model(xgb_spec)
 
-
-xgb_grid <- grid_space_filling(
-  tree_depth(range = xgb_param_ranges$tree_depth),
-  min_n(range = xgb_param_ranges$min_n),
-  sample_size = sample_prop(range = xgb_param_ranges$sample_size),
-  finalize(mtry(range = xgb_param_ranges$mtry), train_unbal),
-  size = 25
-)
-
-xgb_wf <- workflow() %>% add_recipe(diab_rec_selected) %>% add_model(xgb_spec)
 xgb_params <- xgb_wf %>%
   extract_parameter_set_dials() %>%
   update(
-    tree_depth = tree_depth(range = xgb_param_ranges$tree_depth),
-    min_n = min_n(range = xgb_param_ranges$min_n),
-    sample_size = sample_prop(range = xgb_param_ranges$sample_size),
-    mtry = finalize(mtry(range = xgb_param_ranges$mtry), train_unbal)
-)
+    tree_depth      = tree_depth(range = c(2L, 4L)),
+    min_n           = min_n(range = c(20L, 60L)),
+    sample_size     = sample_prop(range = c(0.5, 0.8)),
+    mtry            = finalize(mtry(range = c(3L, 10L)), train_unbal),
+    loss_reduction  = loss_reduction(range = c(0, 5)),
+    lambda          = penalty(range = c(1, 20)),
+    alpha           = penalty(range = c(0.5, 10))
+  )
 
+xgb_grid <- grid_space_filling(xgb_params, size = 40)
 
-xgb_initial <- tune_grid(
+xgb_res <- tune_grid(
   xgb_wf,
   resamples = unbal_folds_sub,
   grid = xgb_grid,
-  metrics = metric_set(f_meas_pos),
+  metrics = metric_set(pr_auc),
   control = control_grid(save_pred = TRUE, verbose = TRUE)
 )
 
-xgb_ctrl <- control_bayes(
-  save_pred = TRUE,
-  parallel_over = "resamples",
-  verbose = TRUE,
-  no_improve = 10
-)
-
-xgb_res <- tune_bayes(
- xgb_wf,
- resamples = unbal_folds_sub,
- param_info = xgb_params,
- initial = xgb_initial,
- iter = 20,
- control = xgb_ctrl,
- metrics = metric_set(f_meas_pos)
-)
-
-collect_metrics(xgb_res)
-best_xgb <- select_best(xgb_res, metric = "f_meas_pos")
-show_best(xgb_res, metric = "f_meas_pos")
-autoplot(xgb_res) + ggtitle("XGBoost tuning performance")
-
+best_xgb <- select_best(xgb_res, metric = "pr_auc")
 final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
 final_xgb_fit <- fit(final_xgb_wf, data = train_unbal_w)
+show_best(xgb_res, metric = "pr_auc")
 
-# QUICK START (no tuning): uncomment the block below.
-# Comment out xgb_initial through final_xgb_fit, then use the manual block right before xgb_results.
+# We plot tuning performance across each hyperparameter.
+autoplot(xgb_res, metric = "pr_auc") + ggtitle("XGBoost tuning performance")
+
+# We sweep thresholds using CV predictions to optimize for F1-score.
+preds <- collect_predictions(xgb_res) %>%
+  select(id, .config, diabetes_binary, .pred_1)
+
+thr_grid <- seq(0.02, 0.22, by = 0.01)
+
+f_by_thr_xgb <- map_dfr(thr_grid, function(thr) {
+  preds %>%
+    group_by(id, .config) %>%
+    summarise(
+      f = f_meas_vec(
+        truth = diabetes_binary,
+        estimate = factor(if_else(.pred_1 >= thr, "1", "0"),
+                          levels = c("0", "1")),
+        event_level = "second"
+      ),
+      .groups = "drop"
+    ) %>%
+    group_by(.config) %>%
+    summarise(mean_f = mean(f, na.rm = TRUE), .groups = "drop") %>%
+    mutate(.threshold = thr)
+})
+
+best_f <- f_by_thr_xgb %>%
+  group_by(.config) %>%
+  slice_max(mean_f, n = 1) %>%
+  arrange(desc(mean_f))
+
+best_f$.threshold[1]
+
+  # We can skip XGBoost tuning by uncommenting the block below.
+  # We comment out xgb_res through final_xgb_fit, then use the manual block right before xgb_results.
 # xgb_manual_params <- tibble(
-#   mtry        = 19L,
-#   min_n       = 1L,
-#   tree_depth  = 17L,
-#   sample_size = 0.944
+#   mtry           = 9L,
+#   min_n          = 48L,
+#   tree_depth     = 3L,
+#   loss_reduction = 4.38,
+#   sample_size    = 0.623,
+#   lambda         = 8.89e2,
+#   alpha          = 17.0
 # )
 # final_xgb_wf <- finalize_workflow(xgb_wf, xgb_manual_params)
-# final_xgb_fit <- fit(final_xgb_wf, data = train_unbal_w)
+  # final_xgb_fit <- fit(final_xgb_wf, data = train_unbal_w)
 
-xgb_results <- eval_metrics(fit = final_xgb_fit, new_data = test_unbal, outcome = diabetes_binary)
+xgb_threshold <- 0.08
+xgb_train_results <- eval_metrics(
+  final_xgb_fit,
+  new_data = train_unbal_w,
+  outcome = diabetes_binary,
+  threshold = xgb_threshold
+)
+xgb_results <- eval_metrics(
+  fit = final_xgb_fit,
+  new_data = test_unbal,
+  outcome = diabetes_binary,
+  threshold = xgb_threshold
+)
 
-#vip::vip(
-#  extract_fit_parsnip(final_xgb_fit),
-#  num_features = 40,
-#  geom = "col",
-#  aesthetics = list(fill = bbc_colors[1])
-#)
+
+rm(preds, best_f)
+gc()
+
+vip::vip(
+  extract_fit_parsnip(final_xgb_fit),
+  num_features = 40,
+  geom = "col",
+  aesthetics = list(fill = bbc_colors[1])
+) + ggtitle("XGBoost feature importance")
+
 
 # Random Forest
-rf_spec <- rand_forest(mtry = tune(), min_n = tune(), trees = 1000) %>%
+rf_spec <- rand_forest(
+  mtry  = tune(),
+  min_n = tune(),
+  trees = 1000
+) %>%
   set_mode("classification") %>%
-  set_engine("ranger", class.weights = wt_vec, importance = "impurity", splitrule = "extratrees")
+  set_engine(
+    "ranger",
+    class.weights   = wt_vec,
+    importance      = "impurity",
+    splitrule       = "extratrees",
+    sample.fraction = tune()
+  )
 
-rf_wf <- workflow() %>% add_recipe(diab_rec_selected) %>% add_model(rf_spec)
+rf_wf <- workflow() %>% add_recipe(cleaned_recipe) %>% add_model(rf_spec)
 
-rf_params <- parameters(mtry(), min_n()) %>%
-  update(mtry = mtry(range = c(3L, 15L)), min_n = min_n(range = c(1L, 15L)))
+rf_params <- rf_wf %>%
+  extract_parameter_set_dials() %>%
+  update(
+    mtry        = mtry(range = c(3L, 15L)),
+    min_n       = min_n(range = c(5L, 15L)),
+    sample.fraction = sample_prop(range = c(0.4, 0.9))
+  )
+
 
 rf_grid <- rf_params %>% grid_space_filling(size = 20)
 rf_ctrl <- control_race(save_pred = TRUE, parallel_over = "resamples", verbose_elim = TRUE, verbose = TRUE)
@@ -563,39 +604,95 @@ rf_res <- tune_race_anova(
   resamples = unbal_folds_sub,
   grid = rf_grid,
   control = rf_ctrl,
-  metrics = metric_set(f_meas_pos)
+  metrics = metric_set(pr_auc)
 )
 
 plot_race(rf_res)
 
 collect_metrics(rf_res, summarize = FALSE)
-best_rf <- select_best(rf_res, metric = "f_meas_pos")
-show_best(rf_res, metric = "f_meas_pos")
-autoplot(rf_res) + ggtitle("Random forest tuning performance")
+best_rf <- select_best(rf_res, metric = "pr_auc")
+show_best(rf_res, metric = "pr_auc")
+# We plot tuning performance across each hyperparameter.
+autoplot(rf_res, metric = "pr_auc") + ggtitle("Random Forest tuning performance")
 
-final_rf_wf <- finalize_workflow(rf_wf, best_rf)
-final_rf_fit <- fit(final_rf_wf, data = train_unbal_w)
-final_rf_fit
+# Threshold sweeping
+preds <- collect_predictions(rf_res) %>%
+  select(id, .config, diabetes_binary, .pred_1)
+
+f_by_thr_rf <- map_dfr(thr_grid, function(thr) {
+  preds %>%
+    group_by(id, .config) %>%
+    summarise(
+      f = suppressWarnings(
+        f_meas_vec(
+          truth = diabetes_binary,
+          estimate = factor(
+            if_else(.pred_1 >= thr, "1", "0"),
+            levels = c("0", "1")
+          ),
+          event_level = "second"
+        )
+      ),
+      .groups = "drop"
+    ) %>%
+    group_by(.config) %>%
+    summarise(mean_f = mean(f, na.rm = TRUE), .groups = "drop") %>%
+    mutate(.threshold = thr)
+})
+
+rf_best_f <- f_by_thr_rf %>%
+  group_by(.config) %>%
+  slice_max(mean_f, n = 1, with_ties = FALSE) %>%
+  arrange(desc(mean_f))
+
+rf_best_f$.threshold[1]
 
 # (no tuning): uncomment the block below.
-# rf_manual_params <- tibble(mtry = 11L, min_n = 2L)
+# rf_manual_params <- tibble(mtry = 3L, min_n = 11L)
 # final_rf_wf <- finalize_workflow(rf_wf, rf_manual_params)
 # final_rf_fit <- fit(final_rf_wf, data = train_unbal_w)
 # rf_results <- eval_metrics(fit = final_rf_fit, new_data = test_unbal, outcome = diabetes_binary)
 
+rf_threshold <- 0.19
+rf_train_results   <- eval_metrics(final_rf_fit,  new_data = train_unbal_w, outcome = diabetes_binary, threshold = rf_threshold)
+rf_results <- eval_metrics(fit = final_rf_fit, new_data = test_unbal, outcome = diabetes_binary, threshold = rf_threshold)
 
-rf_results <- eval_metrics(fit = final_rf_fit, new_data = test_unbal, outcome = diabetes_binary)
-#vip::vip(
-#  extract_fit_parsnip(final_rf_fit),
-#  num_features = 40,
-#  geom = "col",
-#  aesthetics = list(fill = bbc_colors[2])
-#)
+vip::vip(
+ extract_fit_parsnip(final_rf_fit),
+ num_features = 40,
+ geom = "col",
+ aesthetics = list(fill = bbc_colors[2])
+) + ggtitle("RanfomForest feature importance")
 
 ################################################################################
 ################# EVALUATION ###################################################
+# Checking for overfitting
+# Logistic
+bind_rows(
+  test  = log_results$metrics,
+  train = log_train_results$metrics,
+  .id = "split"
+) %>% pivot_wider(names_from = split, values_from = .estimate)
+# CART
+bind_rows(
+  test  = cart_results$metrics,
+  train = cart_train_results$metrics,
+  .id = "split"
+) %>% pivot_wider(names_from = split, values_from = .estimate)
+# XGboost
+bind_rows(
+  test  = xgb_results$metrics,
+  train = xgb_train_results$metrics,
+  .id = "split"
+) %>% pivot_wider(names_from = split, values_from = .estimate)
+# Random Forest
+bind_rows(
+  test  = rf_results$metrics,
+  train = rf_train_results$metrics,
+  .id = "split"
+) %>% pivot_wider(names_from = split, values_from = .estimate)
 
-# Compare evaluation metrics, confusion matrices, and ROC curves across all fitted models.
+# We compare evaluation metrics, confusion matrices, and ROC curves across models.
 metrics_df <- bind_rows(
   Logistic = log_results$metrics,
   CART = cart_results$metrics,
