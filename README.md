@@ -1,88 +1,126 @@
-################################################################################
-################# ITERATIVE MODEL DEVELOPMENT JOURNAL ###################
+# Diabetes Classification (BRFSS 2015) - Tidymodels Project
 
-This document records everything accomplished during the current Codex session: the initial state of the diabetes modeling script, every refactor, each modeling experiment, and the rationale behind the final configuration. The overarching goals were to (1) understand the BRFSS data through reproducible EDA, (2) build a consistent tidymodels workflow, (3) improve recall/F1 on the minority class, and (4) make the script teacher-ready and reproducible.
-This is from the last sprint to finish the project. A lot of iterations happened before this too. The core problem was that we didnt use class weights and tomek before and we tuned for AUC. The result was that all our models had the same AUC of around .83. Where the logistic regression was one of the best performing models despite tuning both an xgb model, a randomforest model and a neural network. We managed to drop complexity by removing and redundant features and optimize for F1 score instead.
---------------------------------------------------------------------------------
-### 1. Starting Point
-- The original `diabetes__.R` script bundled data import, EDA, modeling, and Shiny UI into one large file. Models (logistic regression, random forest, XGBoost, neural net) ran on both balanced/unbalanced datasets, tuned mostly for ROC/AUC, and used bespoke metric code.
-- Class imbalance handling was ad hoc: sometimes training on a balanced CSV, other times sampling the unbalanced set manually. Tomek links were applied outside recipes, and the logistic regression still relied on direct `glm()`.
-- Evaluation was manual: computing confusion matrices, ROC curves, and metrics individually per model. The script had no easy way to compare models side by side.
+## Goal
+This project asks a practical question with societal and business relevance:
 
---------------------------------------------------------------------------------
-### 2. Early Refactors and Metric Handling
-- Converted logistic regression to a tidymodels `workflow()` so it could share preprocessing and resampling infrastructure with the other models.
-- Refactored `eval_metrics()` to accept any parsnip/workflow object, call `predict(type="prob"/"class")`, and return metrics, confusion matrices, ROC curves, and prediction tibbles. This eliminates one-off code.
-- Consolidated EDA into a single Shiny section: applied a BBC-inspired theme, improved layout, and ensured every plot inherits the same color palette.
+- Can we reliably identify diabetics from a simple questionnaire-style dataset that reflects a real-world class-imbalance problem?
+- Which self-reported health indicators carry the strongest signal for classifying diabetics?
 
---------------------------------------------------------------------------------
-### 3. Weights, Tomek Links, and Resampling
-- Computed class weights (`importance_weights`) on the training split and stored them in a `case_wt` column. Recipes now declare `case_weights = case_wt`, giving every downstream model a `class_weight = 'balanced'` equivalent.
-- Instead of keeping Tomek-filtered columns around, embedded `themis::step_tomek()` near the end of the recipe. This ensures Tomek removal respects resamples and case weights.
-- Originally we sliced 5% of the training data to accelerate tuning, but folds contained too few positives, leading to NA precision/F1. Increased the slice to 25% (and considered full data) and later added explicit seeds before slice sampling and v-fold creation to keep runs reproducible.
+The focus is a binary classifier for `diabetes_binary` (0 = non-diabetic, 1 = diabetic).
 
---------------------------------------------------------------------------------
-### 4. Unified Feature Engineering
-- Built `diab_rec_unified`, which:
-  * Encodes ordered factors (age, education, income, general health) into numeric `*_num` columns while leaving the originals for dummy encoding.
-  * Adds BMI categories, BMI–age interactions, cardio risk index (sum of blood pressure/cholesterol/heart/stroke), obesity indicator, censored/log-transformed health-day counts, spline terms for age/BMI/phys/mental health, and interactions like `age_num:high_bp_num`.
-  * Applies dummy encoding, removes zero-variance predictors, executes `step_tomek()`, and normalizes all predictors.
-- Fitted a CART model and extracted `variable.importance`, plus logistic regression z-scores. Printed both tibbles (with `print(n = Inf)`) to inspect feature contributions.
-- Created `diab_rec_selected` by removing features with p ≥ 0.05 (logistic) and CART importance < 157. The removed set included high-order polynomials, redundant dummies, and weak engineered terms.
+## Data
+- Source: BRFSS 2015 health indicators dataset (CSV files included in the repo).
+- Files:
+  - `diabetes_binary_health_indicators_BRFSS2015.csv` (unbalanced; used for modeling)
+  - `diabetes_binary_5050split_health_indicators_BRFSS2015.csv` (balanced; used only for EDA plots where raw frequencies are otherwise hard to compare)
+- Key challenge: strong class imbalance in the unbalanced dataset (diabetics are the minority).
 
---------------------------------------------------------------------------------
-### 5. Modeling Iterations
-**Logistic Regression & CART**
-- Retained as baselines. Their z-scores and variable importances are stored for reporting. CART also outputs metrics/confusion matrix so it can be compared to other models.
+## What The Script Does (diabetes__.R)
+`diabetes__.R` is runnable top-to-bottom and contains:
 
-**Random Forest**
-- Tuned with `tune_race_anova()` using `mtry` 3–15, `min_n` 2–15, 1000 trees, `class.weights = wt_vec`, `splitrule = "extratrees"`. Racing was preferred over Bayesian optimization for simplicity. Best RF now yields accuracy 0.922, recall 0.506, F1 0.643, ROC AUC 0.913.
+1. Data import and inspection (structure, summaries, missingness, class balance).
+2. Data cleaning (casting binary indicators to factors; ordered factors for age/income/education/general health).
+3. Train/test split (stratified) and class weights:
+   - We compute per-class weights on the training set.
+   - We store weights in a `case_wt` column using `hardhat::importance_weights()`.
+4. EDA (optional Shiny dashboard):
+   - Unbalanced vs balanced visual comparisons (binary distributions use the balanced dataset).
+   - Correlation-with-outcome bar chart, correlation heatmap with extremes, numeric boxplots, and age/BMI distributions.
+   - Note: the `shinyApp(ui, server)` call is commented out so `source()` does not block.
+5. A unified preprocessing recipe for tree-based models (`model_recipe`):
+   - Converts the 4 ordered predictors (`gen_hlth`, `age`, `education`, `income`) to numeric versions and removes the originals.
+   - Dummy encodes remaining factor predictors (binary indicators).
+   - Applies Tomek links via `themis::step_tomek()` (to remove ambiguous border cases).
+   - Drops zero-variance predictors.
+6. Baseline models for signal and interpretability:
+   - Logistic regression (`glm`) on the unweighted unbalanced training set.
+   - CART (`rpart`) using the recipe.
+   - We extract feature signal using:
+     - logistic regression z-scores (`broom::tidy()`)
+     - CART `variable.importance`
+   - A small list of low-signal engineered/dummy features is removed to form `cleaned_recipe`.
+7. XGBoost model (main model):
+   - Uses `xgboost` via tidymodels.
+   - Uses relaxed class weighting in the engine (`scale_pos_weight = sqrt(sub_class_ratio)`).
+   - Tunes a hyperparameter grid with cross-validation (`tune_grid()`).
+   - Tuning metrics include both:
+     - `pr_auc` (yardstick default event level; effectively targets class "0" if levels are c("0","1"))
+     - `pr_auc_tune` (custom metric targeting the positive class, i.e., diabetics)
+     - `roc_auc`
+8. Threshold selection for classification:
+   - We do not rely on the default 0.5 cutoff.
+   - We sweep thresholds on out-of-fold predictions and select a cutoff (used in evaluation).
+   - Current threshold used in the script: `xgb_threshold <- 0.08`.
+9. Final evaluation and diagnostics:
+   - `eval_metrics()` produces accuracy, precision, recall, F1, ROC-AUC, and PR-AUC plus confusion matrix and ROC curve.
+   - We compare train vs test metrics to check overfitting.
+   - We compare logistic vs CART vs XGBoost side-by-side.
+10. Model interpretation:
+   - XGBoost feature importance plot via `vip::vip()`.
+   - A single XGBoost tree visualization via `xgboost::xgb.plot.tree()`.
 
-**XGBoost**
-- Early `tune_grid()` runs produced F1 ≈ 0.04 due to aggressive Tomek filtering, default `scale_pos_weight`, and 0.5 thresholds. We:
-  * Widened parameter ranges (tree depth 2–18, min_n 1–30, sample size 0.05–1.0, mtry 2–20) and added tunable `learn_rate`, `loss_reduction`, `scale_pos_weight`.
-  * Switched to `tune_bayes()` seeded by a 25-point Latin-hypercube grid, with verbose logging, `no_improve = 10`, and progress updates.
-  * Collected predictions from the best resamples, used `yardstick::threshold_perf()` to find the F1-maximizing probability cutoff, and passed that threshold to `eval_metrics()` (which now accepts a `threshold` argument). Falling back to 0.5 if the tuned threshold is `NA`.
-  * Seeds are set for the initial grid and Bayesian search to keep runs deterministic.
+## Results (Test Set)
+From `Final run with tomek squared weights.txt` (threshold = 0.08), the test-set metrics were:
 
-**Neural Network**
-- Initially tuned hidden units (8, 16, 32). To simplify and keep runtime manageable, we fixed the architecture at 10 hidden units, 20 epochs, `penalty = 1e-4`, `learn_rate = 0.01`, `MaxNWts = 5000`, and fit with a seed. Later, once it was clear the NN provided no improvement over logistic regression, we removed it entirely from the pipeline to shorten runtimes and logs.
+- Logistic (glm baseline):
+  - accuracy 0.865, precision 0.562, recall 0.152, f_meas 0.239, roc_auc 0.825, pr_auc 0.414
+- CART (rpart baseline):
+  - accuracy 0.866, precision 0.612, recall 0.100, f_meas 0.172, roc_auc 0.647, pr_auc 0.353
+- XGBoost (tuned + thresholded at 0.08):
+  - accuracy 0.807, precision 0.381, recall 0.619, f_meas 0.471, roc_auc 0.829, pr_auc 0.430
+  - confusion matrix:
+    - TN 54832, FP 10669, FN 4044, TP 6560
 
---------------------------------------------------------------------------------
-### 6. Evaluation Upgrades
-- `metrics_df` gathers model metrics (logistic, CART, XGB, RF) and pivots them wide for easy comparison. The confusion matrices and ROC curves for each model are printed, and a combined ROC plot (log/cart/xgb/rf) shows relative performance.
-- Autoplot outputs are added after each tuning run (XGB, RF) so we can visualize the search path. Warnings about fonts (Helvetica) remain because the Windows box lacks that font; we left them as they don’t impact modeling.
-- Added optional manual-parameter blocks (commented) for XGB and RF that can be uncommented to skip tuning when needed.
-- Shiny app now focuses solely on the unbalanced dataset, removes unused toggles, includes correlation heatmap and table of extremes, age/BMI histograms, and binary distributions built from the balanced dataset for clearer comparisons.
+Interpretation:
+- Logistic and CART are stable and interpretable but have low recall for diabetics at the chosen threshold.
+- XGBoost increases recall substantially (more diabetics found) at the cost of more false positives.
 
---------------------------------------------------------------------------------
-### 7. Key Learnings
-- **Case weights + Tomek** inside recipes keep pipelines consistent, but Tomek can strip borderline positives required by boosting models; RF handles this better due to ensemble diversity.
-- **EDA-driven feature selection** (CART variable importance + logistic z-scores) yields a cleaner design matrix, which speeds tuning and improves interpretability.
-- **Sampling fraction vs. folds**: shrinking the dataset for speed creates folds with too few positives; better to reduce fold count or use racing/Bayesian tuning on the full data.
-- **Bayesian tuning + threshold calibration**: tuning log-loss alone doesn’t maximize F1; calibrating `scale_pos_weight` and the classification threshold is essential for imbalanced data.
-- **Explicit seeds** at every stochastic step (slice sampling, vfold CV, tune grid/race/bayes, neural net fit) are required for reproducibility when sharing scripts.
+## Key Issues We Hit (And Fixes)
+- Package/version issues:
+  - `tidymodels` required `rlang >= 1.1.6`; restarting R and updating packages was necessary.
+  - Some packages were missing (e.g., `doParallel`) and had to be installed.
+- Metric targeting confusion:
+  - `pr_auc()` in yardstick defaults to the first factor level as the "event" unless specified.
+  - Because our positive class is "1", we added a custom metric (`pr_auc_tune`) that explicitly targets `event_level = "second"` for tuning.
+- Threshold matters:
+  - Optimizing PR-AUC or ROC-AUC does not automatically produce a good F1 at threshold 0.5.
+  - A lower threshold (0.08) materially improved recall/F1 for diabetics.
+- Runtime and memory:
+  - Saving out-of-fold predictions (`save_pred = TRUE`) is helpful for threshold selection, but increases memory usage.
+  - Large cross-joins (predictions x thresholds) can cause memory errors; threshold sweeps should be kept modest.
+- Tomek links integration:
+  - `step_tomek()` requires numeric predictors, so factor/ordered variables must be converted (dummy-encoded and/or numeric-encoded) before the Tomek step.
 
---------------------------------------------------------------------------------
-### 8. Current State vs. Start
-- Started with a monolithic script, base R logistic regression, inconsistent imbalance handling, and manual metrics.
-- Ended with tidy recipes (`diab_rec_unified` and `diab_rec_selected`), Shiny EDA enhancements, weight-aware pipelines, CART/logistic importance diagnostics, reproducibility aids (seeds/manual blocks), Bayesian-tuned XGB with threshold calibration, race-tuned RF, fixed NN, and consolidated evaluation tables. RF is now the leading performer (F1 ≈ 0.64), with logistic/CART serving as interpretable baselines and XGB improving but still under review.
+## Reproducibility
+- The script sets a seed for major random steps (e.g., train/test split).
+- Exact bit-for-bit reproducibility is not guaranteed across machines due to:
+  - parallel execution,
+  - stochastic model training inside xgboost,
+  - potential differences in package versions.
 
---------------------------------------------------------------------------------
-### 9. Next Steps (Future Work)
-- Train/tune models on the full weighted training set (no slicing) to give XGB/NN more positives.
-- Explore other imbalance strategies (SMOTE, ROSE, themis steps) or tune Tomek aggressiveness per model.
-- Automate threshold calibration for every model and compare against cost-sensitive objectives.
-- Package major steps into functions/modules, add reproducible logging via `sink()`, and consider saving fitted workflows for deployment.
+For grading/review, the script is written so another person can run it end-to-end and obtain very similar results when using the same R version and package versions.
 
---------------------------------------------------------------------------------
-### 10. Session Timeline (Key Actions)
-1. Refactored logistic regression into tidymodels; rewrote `eval_metrics()`.
-2. Rebuilt Shiny EDA with correlation heatmap, age/BMI histograms, binary plots, and removed unused options.
-3. Embedded case weights and `step_tomek()` into recipes; standardized resampling with seeds.
-4. Ran CART/logistic importance analyses and pruned low-signal engineered features.
-5. Added manual-parameter comments and reproducibility seeds across all stochastic steps.
-6. Tuned RF via racing, removed the neural net after confirming it didn’t outperform logistic regression, and overhauled XGBoost with wider parameter space, Bayesian tuning, tuned `scale_pos_weight`, and threshold calibration.
-7. Attempted an even richer XGBoost search (tuning class weights and probability thresholds together). Gaussian-process models repeatedly failed whenever folds contained zero positive predictions, so we reverted to the simpler configuration above. Even with 95% of the data, XGB still struggles to predict positives; we’re experimenting with relaxing class weights (e.g., using `sqrt` of the class ratio) to coax more positive predictions.
+## How To Run
+Recommended: run in RStudio from the project directory.
 
-This README is meant to be both a narrative log and a technical reference for future iterations. It explains what changed, why it changed, and how each decision affected performance—especially the jump from baseline models to the current high-recall random forest.
+- Run the full script:
+  - `source("diabetes__.R", echo = TRUE, max.deparse.length = Inf)`
+
+- Save a full console log to a file (non-interactive run):
+  - Use `run_with_log.R` (already included) and run it with Rscript.
+  - If `Rscript` is not on PATH, use the full path, e.g.:
+    - `& "C:\\Program Files\\R\\R-4.4.3\\bin\\Rscript.exe" run_with_log.R`
+
+## Skipping Tuning (Instructor Quick Start)
+The script includes a clearly marked commented block for XGBoost manual parameters.
+
+To skip tuning:
+- Comment out the tuning block (the script tells you exactly which lines).
+- Uncomment the `xgb_manual_params <- tibble(...)` block and the `final_xgb_fit <- ...` lines.
+- Keep `xgb_threshold <- 0.08` (or adjust if you want a different precision/recall trade-off).
+
+## Repository Files
+- `diabetes__.R`: main script (EDA + modeling + evaluation).
+- `run_with_log.R`: helper to run `diabetes__.R` and write output to a timestamped log.
+- `Final run with tomek squared weights.txt`: reference run output used for reporting results.
+- `Final run without tomek with sqrt weights.txt`: older reference run used for history.
