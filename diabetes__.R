@@ -70,9 +70,6 @@ eval_metrics <- function(fit, new_data, outcome, threshold = 0.5) {
       truth = !!outcome,
       .pred_1,
       event_level = "second"))}
-# We create a custom pr-auc metric that targets the positive class. pr_auc and pr_auc_tune is computed the same way
-pr_auc_tune <- metric_tweak("pr_auc_tune", pr_auc, event_level = "second")
-
 
 ################################################################################
 ################# DATA IMPORT AND INITIAL INSPECTION ###########################
@@ -295,7 +292,7 @@ server <- function(input, output, session) {
       arrange(desc(cor)) %>%
       select(`Variable 1` = var1, `Variable 2` = var2, Correlation = cor)})}
 
-# shinyApp(ui, server)
+shinyApp(ui, server)
 
 ################################################################################
 ################# FEATURE ENGINEERING ##########################################
@@ -395,13 +392,17 @@ xgb_spec <- boost_tree(
   min_n = tune(),
   loss_reduction = tune(),
   sample_size = tune(),
-  mtry = tune()) %>%
+  mtry = tune(),
+  stop_iter = 30
+) %>%
   set_engine(
     "xgboost",
+    validation = 0.2,
+    eval_metric = "auc",
     scale_pos_weight = pos_weight,
     lambda = tune(),
-    alpha  = tune(),
-    early_stopping_rounds = 30) %>%
+    alpha  = tune()
+  ) %>%
   set_mode("classification")
 
 xgb_wf <- workflow() %>%
@@ -425,60 +426,11 @@ xgb_res <- tune_grid(
   xgb_wf,
   resamples = unbal_folds_sub,
   grid = xgb_grid,
-  metrics = metric_set(roc_auc, pr_auc_tune),
+  metrics = metric_set(roc_auc),
   control = control_grid(save_pred = TRUE, verbose = FALSE))
-
-# We see which of the models performs best.
-xgb_best_pr_auc <- select_best(xgb_res, metric = "pr_auc_tune")
-xgb_best_roc_auc <- select_best(xgb_res, metric = "roc_auc")
 
 autoplot(xgb_res, metric = "roc_auc") +
   ggtitle("XGBoost tuning performance")
-
-final_xgb_pr_auc_wf <- finalize_workflow(xgb_wf, xgb_best_pr_auc)
-final_xgb_pr_auc_fit <- fit(final_xgb_pr_auc_wf, data = train_unbal_w) 
-
-final_xgb_roc_auc_wf <- finalize_workflow(xgb_wf, xgb_best_roc_auc)
-final_xgb_roc_auc_fit <- fit(final_xgb_roc_auc_wf, data = train_unbal_w)
-
-xgb_pr_auc_train_results <- eval_metrics(
-  final_xgb_pr_auc_fit,
-  new_data = train_unbal_w,
-  outcome = diabetes_binary,
-  threshold = .5)
-xgb_pr_auc_results <- eval_metrics(
-  fit = final_xgb_pr_auc_fit,
-  new_data = test_unbal,
-  outcome = diabetes_binary,
-  threshold = .5)
-
-xgb_roc_auc_train_results <- eval_metrics(
-  final_xgb_roc_auc_fit,
-  new_data = train_unbal_w,
-  outcome = diabetes_binary,
-  threshold = .5)
-xgb_roc_auc_results <- eval_metrics(
-  fit = final_xgb_roc_auc_fit,
-  new_data = test_unbal,
-  outcome = diabetes_binary,
-  threshold = .5)
-
-bind_rows(
-  test  = xgb_pr_auc_results$metrics,
-  train = xgb_pr_auc_train_results$metrics,
-  .id = "split"
-) %>% pivot_wider(names_from = split, values_from = .estimate)
-
-bind_rows(
-  test  = xgb_roc_auc_results$metrics,
-  train = xgb_roc_auc_train_results$metrics,
-  .id = "split"
-) %>% pivot_wider(names_from = split, values_from = .estimate)
-
-xgb_pr_auc_results$confusion_matrix
-xgb_roc_auc_results$confusion_matrix
-
-# We choose to use the model optimized for ROC-AUC
 
 best_xgb <- select_best(xgb_res, metric = "roc_auc")
 final_xgb_wf <- finalize_workflow(xgb_wf, best_xgb)
@@ -516,7 +468,7 @@ xgb_best_f %>%
   filter(.config == best_xgb$.config) %>%
   pull(.threshold)
 
-xgb_threshold <- 0.09
+xgb_threshold <- 0.08
 
 rm(preds, xgb_best_f)
 
@@ -532,10 +484,7 @@ rm(preds, xgb_best_f)
 #   alpha          = 4.12)
 # final_xgb_wf <- finalize_workflow(xgb_wf, xgb_manual_params)
 # final_xgb_fit <- fit(final_xgb_wf, data = train_unbal_w)
-# xgb_threshold <- 0.09
-
-xgboost::xgb.plot.tree(
-  model = extract_fit_engine(final_xgb_fit))
+# xgb_threshold <- 0.08
 
 xgb_train_results <- eval_metrics(
   final_xgb_fit,
@@ -549,6 +498,9 @@ xgb_results <- eval_metrics(
   outcome = diabetes_binary,
   threshold = xgb_threshold
 )
+
+xgboost::xgb.plot.tree(
+  model = extract_fit_engine(final_xgb_fit))
 
 vip::vip(
   extract_fit_parsnip(final_xgb_fit),
